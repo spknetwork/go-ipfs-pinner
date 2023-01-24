@@ -1,6 +1,7 @@
 // Package dspinner implements structures and methods to keep track of
 // which objects a user wants to keep stored locally.  This implementation
 // stores pin data in a datastore.
+// Test asdgfkaopdfigjdpofgk
 package dspinner
 
 import (
@@ -21,13 +22,20 @@ import (
 	"github.com/ipfs/go-merkledag/dagutils"
 	"github.com/polydawn/refmt/cbor"
 	"github.com/polydawn/refmt/obj/atlas"
+	"go.mongodb.org/mongo-driver/bson"
+	"go.mongodb.org/mongo-driver/bson/primitive"
+	"go.mongodb.org/mongo-driver/mongo"
+	"go.mongodb.org/mongo-driver/mongo/options"
 )
 
 const (
-	basePath     = "/pins"
-	pinKeyPath   = "/pins/pin"
-	indexKeyPath = "/pins/index"
-	dirtyKeyPath = "/pins/state/dirty"
+	basePath        = "/pins"
+	pinKeyPath      = "/pins/pin"
+	indexKeyPath    = "/pins/index"
+	dirtyKeyPath    = "/pins/state/dirty"
+	uri             = "mongodb://localhost:27017/?maxPoolSize=20&w=majority"
+	mongo_db        = "pins"
+	collection_name = "pinner"
 )
 
 var (
@@ -106,6 +114,12 @@ type pin struct {
 	Metadata map[string]interface{}
 	Mode     ipfspinner.Mode
 	Name     string
+}
+
+type mongoPinner struct {
+	ID     primitive.ObjectID `bson:"_id,omitempty"`
+	Parent string             `bson:"parent,omitempty"`
+	Child  string             `bson:"child,omitempty"`
 }
 
 func (p *pin) dsKey() ds.Key {
@@ -205,6 +219,33 @@ func (p *pinner) Pin(ctx context.Context, node ipld.Node, recurse bool) error {
 			return err
 		}
 
+		visitedSet := cid.NewSet()
+
+		var stored bool
+		// var rc cid.Cid
+		var e error
+		stored, e = storeChildren(ctx, p.dserv, c, visitedSet.Visit)
+		err = p.cidRIndex.ForEach(ctx, "", func(key, value string) bool {
+			_, e = cid.Cast([]byte(key))
+			if e != nil {
+				return false
+			}
+			if e != nil {
+				return false
+			}
+			if stored {
+				return false
+			}
+			return true
+		})
+		if err != nil {
+			fmt.Println(err)
+		}
+
+		//TODO hook up recursive child finding here. Inserting all
+		//children and parent referencing into the database
+		//Use the code below in removePinsForCid for transversion
+
 		// If autosyncing, sync dag service before making any change to pins
 		err = p.flushDagService(ctx, false)
 		if err != nil {
@@ -272,6 +313,8 @@ func (p *pinner) addPin(ctx context.Context, c cid.Cid, mode ipfspinner.Mode, na
 	if err != nil {
 		return "", err
 	}
+	fmt.Printf(pp.dsKey().String())
+	fmt.Printf(string(pinData))
 
 	// Store CID index
 	switch mode {
@@ -304,8 +347,166 @@ func (p *pinner) addPin(ctx context.Context, c cid.Cid, mode ipfspinner.Mode, na
 			return "", fmt.Errorf("could not add pin name index: %v", err)
 		}
 	}
+	// client, err := mongo.Connect(context.TODO(), options.Client().ApplyURI(uri))
+	// doc := bson.D{
+	// 	{"parent", pp.Id},
+	// 	{"dsKey", pp.dsKey().String()},
+	// 	{"data", pinData},
+	// 	{"mode", mode},
+	// 	{"index", c.KeyString()},
+	// }
+
+	// pinnerCollection := client.Database(mongo_db).Collection(collection_name)
+	// result, err := pinnerCollection.InsertOne(context.TODO(), doc)
+	// fmt.Printf("Inserted document with _id: %v\n%v\n", result.InsertedID, err)
 
 	return pp.Id, nil
+}
+
+func (p *pinner) hasMongoParent(ctx context.Context, child cid.Cid) (bool, error) {
+	//TODO: Takes a child, and does a reverse search on the mongodb database
+	//So, taking a child and determining if it has a parent referencing it
+	//Used for removal of pins and garbage collection
+	client, err := mongo.Connect(context.TODO(), options.Client().ApplyURI(uri))
+	collParent := client.Database(mongo_db).Collection(collection_name)
+	filter := bson.D{{"child", child}}
+	var result mongoPinner
+	cursor, err := collParent.Find(context.TODO(), filter)
+	if err != nil {
+		fmt.Println(err)
+	}
+	parentCount := 0
+	for cursor.Next(context.TODO()) {
+		fmt.Println(&result)
+		if err := cursor.Decode(&result); err != nil {
+			log.Fatal(err)
+		}
+		fmt.Printf("%+v\n", result)
+		parentCount = parentCount + 1
+
+		if cursor.ID() == 0 {
+			return true, err
+		}
+	}
+	if err := cursor.Err(); err != nil {
+		log.Fatal(err)
+	}
+	if parentCount > 0 {
+		return true, err
+	}
+	return false, err
+}
+
+func (p *pinner) getMongoChildren(ctx context.Context, parent cid.Cid) ([]cid.Cid, error) {
+	//Gets a list of all child links from a parent
+	//Used for removal of pins and garbage collection
+	client, err := mongo.Connect(context.TODO(), options.Client().ApplyURI(uri))
+	collChildren := client.Database(mongo_db).Collection(collection_name)
+	filter := bson.D{{"child", parent}}
+	var result mongoPinner
+	cidSet := cid.NewSet()
+	cursor, err := collChildren.Find(context.TODO(), filter)
+	for cursor.Next(context.TODO()) {
+		if err := cursor.Decode(&result); err != nil {
+			log.Fatal(err)
+		}
+
+		var c cid.Cid
+		var e error
+		c, e = cid.Cast([]byte(result.Child))
+		cidSet.Add(c)
+		fmt.Printf("%+v\n", result)
+		fmt.Printf("%+v\n", e)
+	}
+
+	return cidSet.Keys(), err
+}
+
+func removeMongoChildren(ctx context.Context, child string) (bool, error) {
+	client, err := mongo.Connect(context.TODO(), options.Client().ApplyURI(uri))
+	collChild := client.Database(mongo_db).Collection(collection_name)
+	childFilter := bson.D{{"parent", child}}
+	var mongoChild mongoPinner
+	curChild, err := collChild.Find(context.TODO(), childFilter)
+	if err != nil {
+		fmt.Println(err)
+	}
+	parentCount := 0
+	// lastChild := "hi"
+	for curChild.Next(context.TODO()) {
+		if err := curChild.Decode(&mongoChild); err != nil {
+			log.Fatal(err)
+		}
+		parentCount = parentCount + 1
+		childString := mongoChild.Child
+		removed, e := removeMongoChildren(ctx, childString)
+		if e != nil {
+			fmt.Println(err)
+		}
+		fmt.Println(removed)
+		// lastChild = childString
+	}
+	if parentCount < 2 {
+		collChild := client.Database(mongo_db).Collection(collection_name)
+		deleted, err := collChild.DeleteOne(context.TODO(), bson.D{{"parent", child}})
+		if err != nil {
+			fmt.Println(err)
+		}
+		fmt.Println("Deleted document(s) ", deleted)
+		if err != nil {
+			fmt.Println(err)
+		}
+		fmt.Println(deleted)
+
+		return true, err
+	}
+	return false, nil
+
+}
+
+func removeMongoPins(ctx context.Context, parent cid.Cid) (bool, error) {
+	fmt.Println("remove children is running")
+	// 	//1. Look for all children of a parent (search DB)
+	// 	//2. Delete the parent -> children references
+	// 	//3. Look through each children to make sure they don't have a parent
+	// 	//4. If they don't have a parent
+	// 	//5. Then recursively delete all children's children repeat step 3 - 5 until all children-children are gone
+	// 	//6. (happens elsewhere): garbage collection checks DB and removes data from disk
+	client, err := mongo.Connect(context.TODO(), options.Client().ApplyURI(uri))
+	collParent := client.Database(mongo_db).Collection(collection_name)
+	filter := bson.D{{"parent", parent.String()}}
+	fmt.Println("parent string from cid:", parent.String())
+	var result mongoPinner
+	cursor, err := collParent.Find(context.TODO(), filter)
+	if err != nil {
+		fmt.Println(err)
+	}
+
+	fmt.Println(parent.String())
+	for cursor.Next(context.TODO()) {
+		if err := cursor.Decode(&result); err != nil {
+			log.Fatal(err)
+		}
+		fmt.Printf("%+v\n", result)
+
+		removed, e := removeMongoChildren(ctx, result.Child)
+		if err != nil {
+			fmt.Println(e)
+		}
+		fmt.Println(removed)
+		collChild := client.Database(mongo_db).Collection(collection_name)
+		deleted, err := collChild.DeleteOne(ctx, bson.D{{"parent", parent.String()}})
+		if err != nil {
+			fmt.Println(err)
+		}
+		fmt.Println("Deleted document(s) ", deleted)
+		if err != nil {
+			fmt.Println(err)
+		}
+		fmt.Println(deleted)
+	}
+
+	return false, nil
 }
 
 func (p *pinner) removePin(ctx context.Context, pp *pin) error {
@@ -337,6 +538,8 @@ func (p *pinner) removePin(ctx context.Context, pp *pin) error {
 		return err
 	}
 
+	removed, err := removeMongoPins(ctx, pp.Cid)
+	fmt.Println(removed)
 	return nil
 }
 
@@ -592,6 +795,10 @@ func (p *pinner) removePinsForCid(ctx context.Context, c cid.Cid, mode ipfspinne
 	var ids []string
 	var err error
 	cidKey := c.KeyString()
+
+	//TODO: Use the code below to get a list of all child CIDs of an object.
+	//Then iterate against it and store in mongodb. Continue iterating until there are no more children
+
 	switch mode {
 	case ipfspinner.Recursive:
 		ids, err = p.cidRIndex.Search(ctx, cidKey)
@@ -807,6 +1014,16 @@ func (p *pinner) flushPins(ctx context.Context, force bool) error {
 	if err := p.dstore.Sync(ctx, ds.NewKey(basePath)); err != nil {
 		return fmt.Errorf("cannot sync pin state: %v", err)
 	}
+	client, err := mongo.Connect(context.TODO(), options.Client().ApplyURI(uri))
+	if err != nil {
+		return err
+	}
+	pinnerCollection := client.Database("pins").Collection("pinner")
+	filter := bson.D{{"key", ds.NewKey(basePath)}}
+	update := bson.D{{"$set", bson.D{{"key", ds.NewKey(basePath)}}}}
+	result, err := pinnerCollection.UpdateOne(context.TODO(), filter, update)
+	fmt.Printf("Documents matched: %v\n", result.MatchedCount)
+	fmt.Printf("Documents updated: %v\n", result.ModifiedCount)
 	p.setClean(ctx)
 	return nil
 }
@@ -876,6 +1093,51 @@ func hasChild(ctx context.Context, ng ipld.NodeGetter, root cid.Cid, child cid.C
 			if has {
 				return has, nil
 			}
+		}
+	}
+	return false, nil
+}
+
+// hasChild recursively looks for a Cid among the children of a root Cid.
+// The visit function can be used to shortcut already-visited branches.
+func storeChildren(ctx context.Context, ng ipld.NodeGetter, root cid.Cid, visit func(cid.Cid) bool) (bool, error) {
+	fmt.Println("Store children is running")
+	links, err := ipld.GetLinks(ctx, ng, root)
+	if err != nil {
+		return false, err
+	}
+	for _, lnk := range links {
+		child := lnk.Cid
+		fmt.Println(root, "-->", child)
+		c := lnk.Cid
+		// if lnk.Cid.Equals(child) {
+		// 	return true, nil
+		// }
+		if visit(c) {
+			// has, err := hasChild(ctx, ng, c, child, visit)
+			// if err != nil {
+			// 	return false, err
+			// }
+
+			// fmt.Println("Has child", has)
+			// if has {
+
+			storeChildren(ctx, ng, child, visit)
+			client, err := mongo.Connect(context.TODO(), options.Client().ApplyURI(uri))
+			if err != nil {
+				fmt.Println(err)
+			}
+			doc := bson.D{
+				{"parent", root.String()},
+				{"child", child.String()},
+			}
+
+			pinnerCollection := client.Database(mongo_db).Collection(collection_name)
+			result, err := pinnerCollection.InsertOne(context.TODO(), doc)
+			fmt.Printf("Inserted document with _id: %v\n%v\n", result.InsertedID, err)
+
+			// return true, nil
+			// }
 		}
 	}
 	return false, nil
