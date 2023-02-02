@@ -130,6 +130,8 @@ type Pinner interface {
 	// InternalPins returns all cids kept pinned for the internal state of the
 	// pinner
 	InternalPins(ctx context.Context) ([]cid.Cid, error)
+
+	HasMongoParent(ctx context.Context, child cid.Cid) (bool, error)
 }
 
 // Pinned represents CID which has been pinned with a pinning strategy.

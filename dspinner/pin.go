@@ -34,8 +34,8 @@ const (
 	indexKeyPath    = "/pins/index"
 	dirtyKeyPath    = "/pins/state/dirty"
 	uri             = "mongodb://localhost:27017/?maxPoolSize=20&w=majority"
-	mongo_db        = "pins"
-	collection_name = "pinner"
+	mongo_db        = "go-ipfs"
+	collection_name = "links"
 )
 
 var (
@@ -358,43 +358,54 @@ func (p *pinner) addPin(ctx context.Context, c cid.Cid, mode ipfspinner.Mode, na
 
 	// pinnerCollection := client.Database(mongo_db).Collection(collection_name)
 	// result, err := pinnerCollection.InsertOne(context.TODO(), doc)
-	// fmt.Printf("Inserted document with _id: %v\n%v\n", result.InsertedID, err)
+	// fmt.Printf("Inserted document with _id: %v\n%v\n", result.InsertOtedID, err)
 
 	return pp.Id, nil
 }
 
-func (p *pinner) hasMongoParent(ctx context.Context, child cid.Cid) (bool, error) {
+func (p *pinner) HasMongoParent(ctx context.Context, child cid.Cid) (bool, error) {
 	//TODO: Takes a child, and does a reverse search on the mongodb database
 	//So, taking a child and determining if it has a parent referencing it
 	//Used for removal of pins and garbage collection
 	client, err := mongo.Connect(context.TODO(), options.Client().ApplyURI(uri))
 	collParent := client.Database(mongo_db).Collection(collection_name)
-	filter := bson.D{{"child", child}}
-	var result mongoPinner
-	cursor, err := collParent.Find(context.TODO(), filter)
-	if err != nil {
-		fmt.Println(err)
-	}
-	parentCount := 0
-	for cursor.Next(context.TODO()) {
-		fmt.Println(&result)
-		if err := cursor.Decode(&result); err != nil {
-			log.Fatal(err)
-		}
-		fmt.Printf("%+v\n", result)
-		parentCount = parentCount + 1
+	// pin,_ = encodePin(child)
+	filter := bson.D{{"child", child.String()}}
 
-		if cursor.ID() == 0 {
-			return true, err
-		}
-	}
-	if err := cursor.Err(); err != nil {
-		log.Fatal(err)
-	}
-	if parentCount > 0 {
+	parentCount,_ := collParent.CountDocuments(context.TODO(), filter)
+
+	fmt.Println("Children", child)
+	if parentCount == 0 {
+		return false, err
+	} else {
 		return true, err
 	}
-	return false, err
+
+	// var result mongoPinner
+	// cursor, err := collParent.Find(context.TODO(), filter)
+	// if err != nil {
+	// 	fmt.Println(err)
+	// }
+	// parentCount := 0
+	// for cursor.Next(context.TODO()) {
+	// 	fmt.Println(&result)
+	// 	if err := cursor.Decode(&result); err != nil {
+	// 		log.Fatal(err)
+	// 	}
+	// 	fmt.Printf("%+v\n", result)
+	// 	parentCount = parentCount + 1
+
+	// 	if cursor.ID() == 0 {
+	// 		return true, err
+	// 	}
+	// }
+	// if err := cursor.Err(); err != nil {
+	// 	log.Fatal(err)
+	// }
+	// if parentCount > 0 {
+	// 	return true, err
+	// }
+	// return false, err
 }
 
 func (p *pinner) getMongoChildren(ctx context.Context, parent cid.Cid) ([]cid.Cid, error) {
@@ -422,44 +433,53 @@ func (p *pinner) getMongoChildren(ctx context.Context, parent cid.Cid) ([]cid.Ci
 	return cidSet.Keys(), err
 }
 
-func removeMongoChildren(ctx context.Context, child string) (bool, error) {
+func removeMongoChildren(ctx context.Context, startCidInput string) (bool, error) {
 	client, err := mongo.Connect(context.TODO(), options.Client().ApplyURI(uri))
-	collChild := client.Database(mongo_db).Collection(collection_name)
-	childFilter := bson.D{{"parent", child}}
+	linksCollection := client.Database(mongo_db).Collection(collection_name)
+	startCid2,_ := cid.Decode(startCidInput)
+	startCid := cid.NewCidV1(cid.Raw, startCid2.Hash()).String()
+	
+	childFilter := bson.D{{"parent", startCid}}
+	fmt.Println("Broken help", startCid)
+
 	var mongoChild mongoPinner
-	curChild, err := collChild.Find(context.TODO(), childFilter)
+	curChild, err := linksCollection.Find(context.TODO(), childFilter)
 	if err != nil {
 		fmt.Println(err)
 	}
-	parentCount := 0
-	// lastChild := "hi"
-	for curChild.Next(context.TODO()) {
-		if err := curChild.Decode(&mongoChild); err != nil {
-			log.Fatal(err)
-		}
-		parentCount = parentCount + 1
-		childString := mongoChild.Child
-		removed, e := removeMongoChildren(ctx, childString)
-		if e != nil {
-			fmt.Println(err)
-		}
-		fmt.Println(removed)
-		// lastChild = childString
-	}
-	if parentCount < 2 {
-		collChild := client.Database(mongo_db).Collection(collection_name)
-		deleted, err := collChild.DeleteOne(context.TODO(), bson.D{{"parent", child}})
-		if err != nil {
-			fmt.Println(err)
-		}
-		fmt.Println("Deleted document(s) ", deleted)
-		if err != nil {
-			fmt.Println(err)
-		}
-		fmt.Println(deleted)
 
+	parentFilter := bson.D{{"child", startCid}}
+	parentCount, err := linksCollection.CountDocuments(context.TODO(), parentFilter)
+	fmt.Println("ParentCount", parentCount)
+	if parentCount < 2 {
+		// collChild := client.Database(mongo_db).Collection(collection_name)
+		deleted, err := linksCollection.DeleteOne(context.TODO(), bson.D{{"child", startCid}})
+		linksCollection.DeleteOne(context.TODO(), bson.D{{"parent", startCid}})
+		if err != nil {
+			fmt.Println(err)
+		}
+		fmt.Println("Deleted document(s) 1", deleted, startCid)
+		if err != nil {
+			fmt.Println(err)
+		}
+		// fmt.Println(deleted)
+		for curChild.Next(context.TODO()) {
+			if err := curChild.Decode(&mongoChild); err != nil {
+				log.Fatal(err)
+			}
+			childString := mongoChild.Child
+			removed, e := removeMongoChildren(ctx, childString)
+			if e != nil {
+				fmt.Println(err)
+			}
+			fmt.Println(removed)
+		}
+		
 		return true, err
 	}
+	
+	
+	
 	return false, nil
 
 }
@@ -474,15 +494,18 @@ func removeMongoPins(ctx context.Context, parent cid.Cid) (bool, error) {
 	// 	//6. (happens elsewhere): garbage collection checks DB and removes data from disk
 	client, err := mongo.Connect(context.TODO(), options.Client().ApplyURI(uri))
 	collParent := client.Database(mongo_db).Collection(collection_name)
-	filter := bson.D{{"parent", parent.String()}}
-	fmt.Println("parent string from cid:", parent.String())
+
+	parentCid := cid.NewCidV1(cid.Raw, parent.Hash()).String()
+
+	filter := bson.D{{"parent", parentCid}}
+	fmt.Println("parent string from cid:", parentCid)
 	var result mongoPinner
 	cursor, err := collParent.Find(context.TODO(), filter)
 	if err != nil {
 		fmt.Println(err)
 	}
 
-	fmt.Println(parent.String())
+	fmt.Println(parentCid)
 	for cursor.Next(context.TODO()) {
 		if err := cursor.Decode(&result); err != nil {
 			log.Fatal(err)
@@ -495,7 +518,7 @@ func removeMongoPins(ctx context.Context, parent cid.Cid) (bool, error) {
 		}
 		fmt.Println(removed)
 		collChild := client.Database(mongo_db).Collection(collection_name)
-		deleted, err := collChild.DeleteOne(ctx, bson.D{{"parent", parent.String()}})
+		deleted, err := collChild.DeleteOne(ctx, bson.D{{"parent", parentCid}})
 		if err != nil {
 			fmt.Println(err)
 		}
@@ -1021,9 +1044,9 @@ func (p *pinner) flushPins(ctx context.Context, force bool) error {
 	pinnerCollection := client.Database("pins").Collection("pinner")
 	filter := bson.D{{"key", ds.NewKey(basePath)}}
 	update := bson.D{{"$set", bson.D{{"key", ds.NewKey(basePath)}}}}
-	result, err := pinnerCollection.UpdateOne(context.TODO(), filter, update)
-	fmt.Printf("Documents matched: %v\n", result.MatchedCount)
-	fmt.Printf("Documents updated: %v\n", result.ModifiedCount)
+	pinnerCollection.UpdateOne(context.TODO(), filter, update)
+	// fmt.Printf("Documents matched: %v\n", result.MatchedCount)
+	// fmt.Printf("Documents updated: %v\n", result.ModifiedCount)
 	p.setClean(ctx)
 	return nil
 }
@@ -1128,13 +1151,15 @@ func storeChildren(ctx context.Context, ng ipld.NodeGetter, root cid.Cid, visit 
 				fmt.Println(err)
 			}
 			doc := bson.D{
-				{"parent", root.String()},
-				{"child", child.String()},
+				{"parent", cid.NewCidV1(cid.Raw, root.Hash()).String()},
+				{"child", cid.NewCidV1(cid.Raw, child.Hash()).String()},
 			}
+			update := bson.D{{"$set", bson.D{{"test", true}}}}
+			opts := options.Update().SetUpsert(true)
 
 			pinnerCollection := client.Database(mongo_db).Collection(collection_name)
-			result, err := pinnerCollection.InsertOne(context.TODO(), doc)
-			fmt.Printf("Inserted document with _id: %v\n%v\n", result.InsertedID, err)
+			result, err := pinnerCollection.UpdateOne(context.TODO(), doc, update, opts)
+			fmt.Printf("Inserted document with _id: %v\n%v\n", result.UpsertedID, err)
 
 			// return true, nil
 			// }
